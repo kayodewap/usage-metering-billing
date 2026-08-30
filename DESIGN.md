@@ -15,6 +15,8 @@ The system is designed around:
 
 The application uses Node.js, Express, and PostgreSQL.
 
+---
+
 ## 2. Architecture
 
 The application follows a layered architecture:
@@ -29,13 +31,23 @@ Services
 ↓
 PostgreSQL
 
+### Routes
+
 Routes are responsible for handling HTTP requests and responses.
 
-Validation is responsible for validating incoming request data.
+### Validation
 
-Services contain application and database operations.
+Validation is responsible for validating incoming request data using Express Validator.
+
+### Services
+
+Services contain application logic and database operations.
+
+### PostgreSQL
 
 PostgreSQL is responsible for persistent data storage and enforcing database constraints.
+
+---
 
 ## 3. Database
 
@@ -74,11 +86,15 @@ subscriptions
 ↓
 plans
 
-A subscription also contains fields for future Stripe integration.
+A subscription contains fields for future Stripe integration, including:
+
+- stripe_customer_id
+- stripe_subscription_id
+- status
 
 ### Usage Events
 
-Usage events record consumption by tenants.
+Usage events record resource consumption by tenants.
 
 Each event contains:
 
@@ -90,6 +106,18 @@ Each event contains:
 - created_at
 
 The tenant relationship is enforced using a foreign key.
+
+The database also enforces uniqueness on:
+
+(tenant_id, idempotency_key)
+
+### Webhook Events
+
+The `webhook_events` table is reserved for storing processed Stripe webhook events and supporting webhook idempotency.
+
+Stripe webhook processing will be implemented later.
+
+---
 
 ## 4. Usage Metering
 
@@ -109,14 +137,76 @@ Usage Service
 ↓
 PostgreSQL
 
-Usage types can represent different forms of consumption, such as:
+Usage types currently supported by the usage service are:
 
-- API calls
-- AI tokens
+- api_call
+- ai_tokens
 
-The quantity field represents how much of the resource was consumed.
+The `quantity` field represents how much of the resource was consumed.
 
-## 5. Idempotency
+### Usage Recording
+
+When usage is recorded, the usage service:
+
+1. Begins a PostgreSQL transaction.
+2. Finds the tenant's active subscription.
+3. Locks the subscription row.
+4. Determines the quota from the tenant's plan.
+5. Calculates the tenant's current usage.
+6. Checks whether the requested usage would exceed the quota.
+7. Records the usage event if the quota allows it.
+8. Commits the transaction.
+
+If an error occurs, the transaction is rolled back.
+
+---
+
+## 5. Usage Aggregation
+
+Current usage is calculated from the `usage_events` table.
+
+The usage service calculates the total quantity for:
+
+- tenant
+- usage type
+
+For example:
+
+api_call usage =
+SUM(quantity)
+WHERE tenant_id = X
+AND type = 'api_call'
+
+This allows the system to determine how much of a tenant's quota has already been consumed.
+
+---
+
+## 6. Quota Enforcement
+
+Quota enforcement is performed inside the usage transaction.
+
+The service compares:
+
+current usage + requested quantity
+
+against the quota defined by the tenant's active plan.
+
+If the request would exceed the quota, the usage event is rejected.
+
+The response includes:
+
+- current usage
+- quota
+- remaining quota
+- requested quantity
+
+The request does not create a usage event when the quota is exceeded.
+
+The subscription row is locked during the transaction to help prevent concurrent usage requests from bypassing quota enforcement.
+
+---
+
+## 7. Idempotency
 
 Usage events use an idempotency key to prevent duplicate usage from being recorded.
 
@@ -132,7 +222,15 @@ This protects the system when a client retries the same request.
 
 A duplicate request does not create another usage event.
 
-## 6. Validation
+The API returns:
+
+- duplicate: true
+
+when the same usage request has already been recorded.
+
+---
+
+## 8. Validation
 
 Express Validator is used to validate API input.
 
@@ -154,11 +252,55 @@ A non-existent tenant returns:
 
 HTTP 404
 
+A tenant without an active subscription returns:
+
+HTTP 404
+
+An unsupported usage type returns:
+
+HTTP 400
+
+A quota-exceeded request returns:
+
+HTTP 403
+
 Unexpected server or database errors return:
 
 HTTP 500
 
-## 7. Current API
+---
+
+## 9. Transactions and Data Consistency
+
+Usage recording uses PostgreSQL transactions.
+
+The transaction begins before subscription and usage checks are performed.
+
+If all checks succeed:
+
+BEGIN
+↓
+Check subscription
+↓
+Lock subscription
+↓
+Calculate usage
+↓
+Check quota
+↓
+Insert usage event
+↓
+COMMIT
+
+If an error occurs:
+
+ROLLBACK
+
+This ensures that a failed usage request does not leave a partially completed operation in the database.
+
+---
+
+## 10. Current API
 
 ### Health Check
 
@@ -176,9 +318,11 @@ Creates a new tenant.
 
 POST /usage
 
-Records a usage event for a tenant.
+Records a usage event for a tenant while enforcing the tenant's plan quota and idempotency rules.
 
-## 8. Development
+---
+
+## 11. Development
 
 Nodemon is used during development so that the server automatically restarts when source files change.
 
@@ -190,16 +334,53 @@ Environment configuration is stored in `.env`.
 
 The `.env` file must not be committed to Git.
 
-## 9. Future Components
+The application uses:
+
+- Node.js
+- Express
+- PostgreSQL
+- pg
+- Express Validator
+- dotenv
+- Stripe SDK
+
+---
+
+## 12. Current Implementation Status
+
+The following components have been implemented:
+
+- PostgreSQL database connection
+- Tenant management
+- Plans
+- Subscriptions
+- Usage events
+- Usage recording
+- Usage aggregation
+- Express Validator validation
+- Usage idempotency
+- Transaction-based usage recording
+- Subscription row locking
+- Plan quota enforcement
+- Quota-exceeded handling
+- Basic API error handling
+- Nodemon development workflow
+
+---
+
+## 13. Future Components
 
 The following components will be implemented as the project progresses:
 
-- Usage quota checking
-- Usage aggregation
-- Subscription management
+- Subscription management API
 - Billing calculations
-- Stripe integration
+- Stripe customer management
+- Stripe subscription integration
 - Stripe webhook processing
+- Webhook idempotency
 - Invoice generation
-- Error handling improvements
+- Billing history
 - Automated tests
+- API documentation
+- Production error handling improvements
+- Production deployment

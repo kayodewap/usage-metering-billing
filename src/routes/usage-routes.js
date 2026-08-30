@@ -49,6 +49,31 @@ router.post("/", recordUsageValidation, async (req, res) => {
   } catch (error) {
     console.error(error);
 
+    if (error.code === "NO_ACTIVE_SUBSCRIPTION") {
+      return res.status(404).json({
+        status: false,
+        message: "No active subscription",
+      });
+    }
+
+    if (error.code === "QUOTA_EXCEEDED") {
+      return res.status(403).json({
+        status: false,
+        message: "Usage quota exceeded",
+        usage: error.currentUsage,
+        quota: error.quota,
+        remaining: error.remaining,
+        requested: error.requested,
+      });
+    }
+
+    if (error.code === "UNSUPPORTED_USAGE_TYPE") {
+      return res.status(400).json({
+        status: false,
+        message: "Unsupported usage type",
+      });
+    }
+
     if (error.code === "23503") {
       return res.status(404).json({
         status: false,
