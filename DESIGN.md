@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-This project is a usage metering and billing system for tracking tenant usage, enforcing plan quotas, and supporting subscription-based billing.
+This project is a usage metering and billing system for tracking tenant usage, enforcing plan quotas, calculating billing information, and integrating Stripe for subscription and payment synchronization.
 
 The system is designed around:
 
@@ -11,9 +11,9 @@ The system is designed around:
 - Subscriptions
 - Usage events
 - Billing
-- Stripe integration
 - Invoices
-- Stripe webhooks
+- Stripe integration
+- Stripe webhook processing
 
 The application uses Node.js, Express, and PostgreSQL.
 
@@ -39,7 +39,7 @@ Services
 
 ↓
 
-PostgreSQL
+PostgreSQL / Stripe
 
 ### Routes
 
@@ -51,15 +51,33 @@ Validation is responsible for validating incoming request data using Express Val
 
 ### Services
 
-Services contain application logic and database operations.
+Services contain application business logic and database operations.
+
+The services include:
+
+- Subscription management
+- Usage metering
+- Billing calculation
+- Invoice retrieval
+- Stripe customer management
+- Stripe subscription management
+- Stripe webhook processing
 
 ### PostgreSQL
 
-PostgreSQL is responsible for persistent data storage and enforcing database constraints.
+PostgreSQL is responsible for persistent data storage, relationships, uniqueness constraints, transactions, and data consistency.
 
 ### Stripe
 
-Stripe is used as the external payment provider for customer management, subscriptions, invoices, and payment-related events.
+Stripe is used as the external payment provider for:
+
+- Stripe customers
+- Stripe subscriptions
+- Subscription status
+- Stripe invoices
+- Payment events
+
+The local database maintains the application's internal representation of tenant, subscription, usage, billing, and invoice information.
 
 ---
 
@@ -67,7 +85,7 @@ Stripe is used as the external payment provider for customer management, subscri
 
 The database is PostgreSQL.
 
-Current tables:
+Current tables include:
 
 - tenants
 - plans
@@ -80,6 +98,13 @@ Current tables:
 
 A tenant represents a customer using the system.
 
+A tenant contains identifying information such as:
+
+- id
+- name
+- email
+- created_at
+
 ### Plans
 
 Plans define the usage limits and pricing available to a tenant.
@@ -89,7 +114,7 @@ Current plans include:
 - Free — 1,000 API calls and 100,000 AI tokens
 - Pro — 50,000 API calls and 5,000,000 AI tokens
 
-Plans currently contain:
+Plans contain:
 
 - name
 - api_call_quota
@@ -126,6 +151,8 @@ plans
 
 A subscription contains:
 
+- tenant_id
+- plan_id
 - stripe_customer_id
 - stripe_subscription_id
 - status
@@ -137,16 +164,9 @@ The subscription service can:
 - Create subscriptions
 - Retrieve a tenant's active subscription
 - Change a tenant's subscription plan
-- Retrieve the associated plan and quota information
-- Retrieve plan pricing information
-
-Stripe integration extends the local subscription with:
-
-- Stripe customer creation
-- Stripe subscription creation
-- Stripe customer ID synchronization
-- Stripe subscription ID synchronization
-- Stripe subscription status synchronization
+- Retrieve associated plan information
+- Retrieve quota information
+- Retrieve pricing information
 
 ### Usage Events
 
@@ -161,39 +181,40 @@ Each event contains:
 - metadata
 - created_at
 
-The tenant relationship is enforced using a foreign key.
-
-The database also enforces uniqueness on:
-
-(tenant_id, idempotency_key)
-
 Supported usage types currently include:
 
 - api_call
 - ai_tokens
 
+The database enforces uniqueness on:
+
+(tenant_id, idempotency_key)
+
+This prevents the same usage request from being recorded multiple times.
+
 ### Webhook Events
 
 The `webhook_events` table stores processed Stripe webhook events.
 
-Each Stripe event is recorded using its Stripe event ID.
+It contains information such as:
 
-The event ID is used to provide webhook idempotency.
+- stripe_event_id
+- event_type
+- processed_at
 
-If Stripe sends the same event more than once, the system detects the existing event and does not process it again.
+The Stripe event ID is used for webhook idempotency.
+
+If Stripe sends the same event more than once, the system detects that the event has already been processed and does not process it again.
 
 ### Invoices
 
-The `invoices` table stores invoice information received from Stripe.
+The `invoices` table stores Stripe invoice information locally.
 
-Invoices are associated with:
+Invoice records include:
 
-- tenant
-- local subscription
-- Stripe invoice ID
-
-Stored invoice information includes:
-
+- tenant_id
+- subscription_id
+- stripe_invoice_id
 - status
 - amount_due
 - amount_paid
@@ -203,7 +224,7 @@ Stored invoice information includes:
 - created_at
 - updated_at
 
-Stripe invoice events update the local invoice record using the Stripe invoice ID.
+Stripe invoice events are synchronized into the local database through verified webhooks.
 
 ---
 
@@ -332,6 +353,10 @@ The request is rejected with:
 
 ## 7. Idempotency
 
+There are two separate idempotency mechanisms in the system.
+
+### Usage Idempotency
+
 Usage events use an idempotency key to prevent duplicate usage from being recorded.
 
 The database enforces uniqueness on:
@@ -340,7 +365,8 @@ The database enforces uniqueness on:
 
 The usage service uses:
 
-ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+ON CONFLICT (tenant_id, idempotency_key)
+DO NOTHING
 
 This protects the system when a client retries the same request.
 
@@ -352,9 +378,21 @@ The API returns:
 
 when the same usage request has already been recorded.
 
-This ensures that a client retry does not accidentally increase the tenant's usage or billing amount.
+### Stripe Webhook Idempotency
 
-Stripe webhook events use a similar idempotency mechanism through the `webhook_events` table.
+Stripe webhook events use:
+
+stripe_event_id
+
+Before processing a webhook, the system checks whether the event ID already exists in `webhook_events`.
+
+If it exists:
+
+- the event is not processed again
+- the transaction is committed
+- the API returns `duplicate: true`
+
+This prevents duplicate Stripe deliveries from causing duplicate database operations.
 
 ---
 
@@ -440,9 +478,41 @@ This ensures that a failed usage request does not leave a partially completed op
 
 The subscription row is locked during the transaction to improve consistency when multiple usage requests are processed concurrently for the same tenant.
 
-Stripe webhook processing also uses PostgreSQL transactions.
+Stripe webhook processing also uses a database transaction.
 
-A webhook event is processed and recorded as part of the same transaction. If processing fails, the transaction is rolled back and the event is not recorded as successfully processed.
+The webhook flow is:
+
+BEGIN
+
+↓
+
+Check webhook event
+
+↓
+
+Reject duplicate if already processed
+
+↓
+
+Process Stripe event
+
+↓
+
+Update local database
+
+↓
+
+Record webhook event
+
+↓
+
+COMMIT
+
+If processing fails:
+
+ROLLBACK
+
+This prevents partially processed webhook events from being recorded as successfully completed.
 
 ---
 
@@ -510,9 +580,7 @@ AI Token Overage Cost = AI Token Overage × AI Token Overage Price
 The final amount is:
 
 Total = Monthly Price
-
       + API Overage Cost
-
       + AI Token Overage Cost
 
 ### Current Implementation Note
@@ -521,7 +589,7 @@ The current usage service treats quotas as hard limits and rejects usage that wo
 
 Therefore, overage billing is currently calculated by the billing service but cannot be reached through normal usage recording while hard quota enforcement is active.
 
-A future architectural decision will determine whether the system should:
+A future architectural decision can determine whether the system should:
 
 1. Keep quotas as hard limits, or
 2. Treat quotas as included usage and allow additional usage to generate overage charges.
@@ -530,7 +598,277 @@ The implementation should be changed only after this decision is made.
 
 ---
 
-## 11. Current API
+## 11. Stripe Integration
+
+Stripe is integrated as the external payment provider.
+
+The intended relationship is:
+
+Tenant
+
+↓
+
+Local Subscription
+
+↓
+
+Stripe Customer
+
+↓
+
+Stripe Subscription
+
+↓
+
+Stripe Invoice
+
+↓
+
+Payment
+
+The local database remains responsible for application-specific tenant, usage, subscription, billing, and invoice data.
+
+Stripe remains the external source of truth for payment-related events.
+
+### Stripe Configuration
+
+Stripe configuration is loaded from environment variables:
+
+STRIPE_SECRET_KEY
+
+STRIPE_WEBHOOK_SECRET
+
+STRIPE_PRO_PRICE_ID
+
+The application does not require Stripe credentials to start when Stripe is not configured.
+
+The Stripe configuration module checks whether a valid Stripe secret key is available before creating the Stripe client.
+
+### Stripe Customer Creation
+
+The application can create a Stripe customer for a tenant.
+
+The customer is created using tenant information such as:
+
+- name
+- email
+
+The tenant ID is also stored in Stripe customer metadata.
+
+The resulting Stripe customer ID is saved in the local subscription record.
+
+If the subscription already contains a Stripe customer ID, the operation returns the existing customer instead of creating another one.
+
+### Stripe Subscription Creation
+
+The application can create a Stripe subscription for a tenant.
+
+The flow is:
+
+Tenant
+
+↓
+
+Local Subscription
+
+↓
+
+Stripe Customer
+
+↓
+
+Stripe Subscription
+
+The configured Stripe Pro price is used when creating the Stripe subscription.
+
+The resulting Stripe subscription ID is stored in the local subscription record.
+
+If a Stripe subscription already exists for the local subscription, another Stripe subscription is not created.
+
+---
+
+## 12. Stripe Webhooks
+
+Stripe webhooks are handled through:
+
+POST /webhooks/stripe
+
+The webhook route uses the raw request body because Stripe signature verification requires the original request payload.
+
+The flow is:
+
+Stripe
+
+↓
+
+POST /webhooks/stripe
+
+↓
+
+Read Stripe signature
+
+↓
+
+Verify signature
+
+↓
+
+Process event
+
+↓
+
+Update PostgreSQL
+
+### Signature Verification
+
+The webhook handler obtains:
+
+stripe-signature
+
+from the request headers.
+
+Stripe's SDK verifies the event using:
+
+- raw request body
+- Stripe signature
+- STRIPE_WEBHOOK_SECRET
+
+Invalid signatures return:
+
+HTTP 400
+
+This prevents forged requests from modifying local subscription or invoice data.
+
+### Webhook Idempotency
+
+Before processing an event, the webhook service checks:
+
+stripe_event_id
+
+against the `webhook_events` table.
+
+If the event has already been processed, the system returns:
+
+duplicate: true
+
+and does not process the event again.
+
+### Subscription Events
+
+The webhook service handles subscription lifecycle events including:
+
+- customer.subscription.created
+- customer.subscription.updated
+- customer.subscription.deleted
+- customer.subscription.paused
+- customer.subscription.resumed
+
+Subscription update events synchronize the local subscription status.
+
+For example:
+
+Stripe subscription updated
+
+↓
+
+Verified webhook
+
+↓
+
+Find local subscription
+
+↓
+
+Update local status
+
+### Invoice Events
+
+The webhook service handles invoice events including:
+
+- invoice.created
+- invoice.finalized
+- invoice.paid
+- invoice.payment_failed
+- invoice.payment_action_required
+- invoice.voided
+- invoice.marked_uncollectible
+
+Invoice information is synchronized into the local `invoices` table.
+
+The local invoice record is identified using:
+
+stripe_invoice_id
+
+If an invoice already exists, the existing record is updated instead of creating a duplicate.
+
+### Payment Events
+
+The webhook service also recognizes payment-related events including:
+
+- payment_intent.succeeded
+- payment_intent.payment_failed
+
+These events are currently logged and processed through the webhook pipeline.
+
+### Unknown Events
+
+Unknown Stripe event types are safely ignored after being recorded as processed webhook events.
+
+---
+
+## 13. Invoices
+
+Invoices are synchronized from Stripe webhook events into PostgreSQL.
+
+The local invoice record contains:
+
+- tenant_id
+- subscription_id
+- stripe_invoice_id
+- status
+- amount_due
+- amount_paid
+- currency
+- period_start
+- period_end
+- created_at
+- updated_at
+
+Invoice amounts received from Stripe are converted from Stripe's smallest currency unit into the application's stored monetary representation.
+
+Invoice records use the Stripe invoice ID as their unique external identifier.
+
+### Invoice API
+
+Invoices can be retrieved for a tenant.
+
+The API supports:
+
+- retrieving a single invoice
+- listing tenant invoices
+- filtering by status
+- filtering by date range
+- pagination
+
+Example:
+
+GET /invoices/:tenantId
+
+Example with pagination:
+
+GET /invoices/:tenantId?page=1&limit=20
+
+Example with status:
+
+GET /invoices/:tenantId?status=paid
+
+Example with date range:
+
+GET /invoices/:tenantId?from=2025-01-01&to=2025-12-31
+
+---
+
+## 14. Current API
 
 ### Health Check
 
@@ -560,7 +898,19 @@ Returns the tenant's active subscription and associated plan information.
 
 PATCH /subscriptions/:tenantId
 
-Changes the active subscription plan for a tenant.
+Changes the tenant's subscription plan.
+
+### Create Stripe Customer
+
+POST /subscriptions/:tenantId/stripe-customer
+
+Creates a Stripe customer for a tenant and stores the Stripe customer ID locally.
+
+### Create Stripe Subscription
+
+POST /subscriptions/:tenantId/stripe-subscription
+
+Creates a Stripe subscription using the configured Stripe Pro price.
 
 ### Record Usage
 
@@ -574,271 +924,27 @@ GET /billing/:tenantId
 
 Returns the tenant's current subscription, plan, usage, quota, remaining quota, overage information, and calculated billing total.
 
-### Create Stripe Customer
-
-POST /subscriptions/:tenantId/stripe-customer
-
-Creates a Stripe customer for a tenant and stores the Stripe customer ID locally.
-
-If the tenant already has a Stripe customer, the existing customer ID is returned.
-
-### Create Stripe Subscription
-
-POST /subscriptions/:tenantId/stripe-subscription
-
-Creates a Stripe subscription for a tenant using the configured Stripe price.
-
-The endpoint requires a Stripe customer to already exist for the tenant.
-
 ### Stripe Webhook
 
 POST /webhooks/stripe
 
-Receives and processes Stripe webhook events.
-
-The endpoint:
-
-- Verifies the Stripe signature
-- Processes supported Stripe events
-- Stores processed event IDs
-- Prevents duplicate event processing
-
-### Get Tenant Invoices
-
-GET /invoices/:tenantId
-
-Returns invoices belonging to the tenant.
-
-Supported query parameters include:
-
-- page
-- limit
-- status
-- from
-- to
+Receives and verifies Stripe webhook events and synchronizes relevant payment and subscription information into PostgreSQL.
 
 ### Get Invoice
 
 GET /invoices/:tenantId/:invoiceId
 
-Returns a specific invoice belonging to the tenant.
+Returns a specific invoice belonging to a tenant.
+
+### List Invoices
+
+GET /invoices/:tenantId
+
+Returns invoices for a tenant with support for filtering and pagination.
 
 ---
 
-## 12. Stripe Integration
-
-Stripe is integrated as the external payment provider for subscription and invoice-related operations.
-
-The relationship is:
-
-Tenant
-
-↓
-
-Local Subscription
-
-↓
-
-Stripe Customer
-
-↓
-
-Stripe Subscription
-
-↓
-
-Stripe Invoice
-
-↓
-
-Stripe Webhook
-
-↓
-
-Local Database
-
-### Stripe Configuration
-
-Stripe is initialized from the environment using:
-
-STRIPE_SECRET_KEY
-
-Stripe is only enabled when a valid Stripe secret key is configured.
-
-The application also uses:
-
-STRIPE_PRO_PRICE_ID
-
-for creating Stripe Pro subscriptions.
-
-Stripe webhook signature verification uses:
-
-STRIPE_WEBHOOK_SECRET
-
-### Stripe Customer
-
-A Stripe customer can be created for a tenant through:
-
-POST /subscriptions/:tenantId/stripe-customer
-
-The system:
-
-1. Validates the tenant.
-2. Retrieves the tenant information.
-3. Checks that the tenant has a local subscription.
-4. Checks whether a Stripe customer already exists.
-5. Creates the customer in Stripe when necessary.
-6. Stores the Stripe customer ID in the local subscription.
-
-Tenant information sent to Stripe includes:
-
-- name
-- email
-- tenant_id metadata
-
-If a Stripe customer already exists, the existing customer ID is returned instead of creating another customer.
-
-### Stripe Subscription
-
-A Stripe subscription can be created through:
-
-POST /subscriptions/:tenantId/stripe-subscription
-
-The system requires:
-
-- Stripe to be configured
-- The tenant to have a local subscription
-- The tenant to have a Stripe customer
-- STRIPE_PRO_PRICE_ID to be configured
-
-The Stripe subscription ID is stored in the local subscription record.
-
-If the Stripe subscription already exists, the existing subscription ID is returned.
-
-### Stripe Webhooks
-
-Stripe webhooks are received through:
-
-POST /webhooks/stripe
-
-The webhook endpoint:
-
-1. Receives the raw Stripe request body.
-2. Reads the Stripe signature.
-3. Verifies the signature using the Stripe webhook secret.
-4. Processes the Stripe event.
-5. Records the Stripe event ID.
-6. Returns a successful response.
-
-Invalid signatures are rejected.
-
-### Webhook Idempotency
-
-Stripe can deliver the same webhook event multiple times.
-
-The system prevents duplicate processing by storing each processed Stripe event in:
-
-`webhook_events`
-
-Before processing an event, the system checks whether its Stripe event ID already exists.
-
-If it exists, the event is not processed again and the API returns:
-
-duplicate: true
-
-This prevents duplicate database updates caused by repeated webhook delivery.
-
-### Subscription Webhooks
-
-The system handles subscription events including:
-
-- customer.subscription.created
-- customer.subscription.updated
-- customer.subscription.deleted
-- customer.subscription.paused
-- customer.subscription.resumed
-
-Subscription status changes are synchronized with the local database.
-
-### Invoice Webhooks
-
-The system handles invoice events including:
-
-- invoice.created
-- invoice.finalized
-- invoice.paid
-- invoice.payment_failed
-- invoice.payment_action_required
-- invoice.voided
-- invoice.marked_uncollectible
-
-Invoice information received from Stripe is stored in the local `invoices` table.
-
-Existing invoices are updated using the Stripe invoice ID.
-
-### Invoice Synchronization
-
-When an invoice webhook is received, the system identifies the related local subscription using:
-
-- Stripe customer ID, or
-- Stripe subscription ID
-
-The invoice is then associated with the correct:
-
-- tenant
-- local subscription
-
-The following Stripe invoice information is stored locally:
-
-- Stripe invoice ID
-- status
-- amount due
-- amount paid
-- currency
-- billing period start
-- billing period end
-
-### Supported Stripe Events
-
-The webhook service currently handles:
-
-Subscription events:
-
-- customer.subscription.created
-- customer.subscription.updated
-- customer.subscription.deleted
-- customer.subscription.paused
-- customer.subscription.resumed
-
-Invoice events:
-
-- invoice.created
-- invoice.finalized
-- invoice.paid
-- invoice.payment_failed
-- invoice.payment_action_required
-- invoice.voided
-- invoice.marked_uncollectible
-
-Payment and checkout events are also recognized:
-
-- checkout.session.completed
-- payment_intent.succeeded
-- payment_intent.payment_failed
-
-Unhandled Stripe event types are logged without failing the webhook transaction.
-
-### External Payment Isolation
-
-Stripe is treated as an external payment provider rather than the source of truth for internal usage metering.
-
-Local usage, tenant, subscription, invoice, and billing data remain under the application's control.
-
-Stripe is responsible for external payment and subscription infrastructure, while the application maintains its own internal usage and billing logic.
-
----
-
-## 13. Development
+## 15. Development
 
 Nodemon is used during development so that the server automatically restarts when source files change.
 
@@ -859,30 +965,37 @@ The application currently uses:
 - Express Validator
 - dotenv
 - Stripe SDK
-- Jest
-- Nodemon
 
-Stripe API calls use Stripe test-mode credentials during development.
+Stripe integration is designed for Stripe test mode.
 
-Required Stripe configuration includes:
+The project does not require real payment processing or real money.
 
-- STRIPE_SECRET_KEY
-- STRIPE_PRO_PRICE_ID
-- STRIPE_WEBHOOK_SECRET
+When Stripe credentials are unavailable, the application safely reports that Stripe is not configured rather than attempting to make Stripe API calls.
 
 ---
 
-## 14. Testing
+## 16. Automated Testing
 
-Automated API tests are implemented using Jest.
+The project uses Jest for automated testing.
 
 The test suite currently covers:
 
-- Health endpoint
-- Usage API
-- Billing API
-- Invoice API
-- Stripe webhook API
+- API health check
+- Usage recording
+- Usage validation
+- Invalid usage types
+- Invalid quantities
+- Missing idempotency keys
+- Usage idempotency
+- Billing summary
+- Missing active subscriptions
+- Invoice retrieval
+- Invoice filtering
+- Invoice pagination
+- Stripe webhook signature verification
+- Stripe webhook processing
+- Duplicate Stripe webhook events
+- Stripe webhook processing failures
 
 Current test result:
 
@@ -890,53 +1003,13 @@ Test Suites: 5 passed, 5 total
 
 Tests: 24 passed, 24 total
 
-The tests cover:
-
-### Health
-
-- API health response
-
-### Usage
-
-- Valid usage recording
-- Invalid usage type
-- Invalid quantity
-- Missing idempotency key
-- Duplicate usage requests
-- Quota enforcement
-
-### Billing
-
-- Billing summary
-- Missing active subscription handling
-
-### Invoices
-
-- Invoice retrieval
-- Invoice pagination
-- Invoice status filtering
-- Invoice date filtering
-- Invalid invoice handling
-
-### Stripe Webhooks
-
-- Missing Stripe signature
-- Invalid Stripe signature
-- Valid webhook processing
-- Duplicate webhook events
-- Webhook processing failures
-
-The current test suite passes successfully with:
-
-npm test
+The Stripe webhook tests use mocked Stripe behavior so that the webhook logic can be tested without requiring live Stripe credentials.
 
 ---
 
-## 15. Current Implementation Status
+## 17. Current Implementation Status
 
 The following components have been implemented:
-
-### Core System
 
 - PostgreSQL database connection
 - Tenant management
@@ -958,74 +1031,84 @@ The following components have been implemented:
 - Billing calculation
 - Billing summary service
 - Billing summary API
-- Basic API error handling
-- Nodemon development workflow
-
-### Stripe Integration
-
 - Stripe configuration
 - Stripe customer creation
-- Stripe customer ID persistence
 - Stripe subscription creation
-- Stripe subscription ID persistence
-- Stripe subscription status synchronization
+- Stripe webhook route
 - Stripe webhook signature verification
 - Stripe webhook processing
 - Stripe webhook idempotency
+- Stripe subscription status synchronization
 - Stripe invoice synchronization
-- Local invoice persistence
-- Invoice status updates
-- Invoice retrieval API
-
-### Testing
-
-Automated tests have been added using Jest.
-
-Current result:
-
-- 5 test suites passing
-- 24 tests passing
-
-Tested areas include:
-
-- Health endpoint
-- Usage recording
-- Usage validation
-- Usage idempotency
-- Quota enforcement
-- Billing summary
+- Local invoice storage
 - Invoice retrieval
 - Invoice filtering
 - Invoice pagination
-- Stripe webhook signature validation
-- Stripe webhook processing
-- Stripe webhook idempotency
-- Stripe webhook error handling
+- Automated Jest tests
+- Nodemon development workflow
+- Basic API error handling
+
+The following have been tested successfully:
+
+- Creating tenants
+- Creating subscriptions
+- Retrieving active subscriptions
+- Changing subscriptions
+- Recording API usage
+- Recording AI token usage
+- Rejecting invalid quantities
+- Rejecting unsupported usage types
+- Rejecting usage for tenants without valid subscriptions
+- Enforcing quotas
+- Preventing duplicate usage events
+- Aggregating usage
+- Calculating remaining quota
+- Calculating usage percentages
+- Calculating base subscription billing
+- Returning billing summaries through the API
+- Retrieving invoices
+- Filtering invoices
+- Paginating invoices
+- Rejecting missing Stripe signatures
+- Rejecting invalid Stripe signatures
+- Processing valid Stripe webhook events
+- Detecting duplicate Stripe webhook events
+- Handling webhook processing failures
+
+The automated test suite currently reports:
+
+5 test suites passed
+
+24 tests passed
 
 ---
 
-## 16. Future Components
+## 18. Future Components
 
-The following components remain future work:
+The following are possible future improvements:
 
-- Usage period management
-- Billing period calculations
-- Advanced overage billing
-- Automated payment workflows
-- Expanded Stripe payment flows
-- Checkout/payment UI
-- API documentation
-- Production error handling improvements
+- True Stripe Checkout session flow
+- Automatic plan synchronization based on Stripe price IDs
+- Automatic invoice generation through Stripe billing cycles
+- Usage-period-specific aggregation
+- Monthly billing period calculations
+- Automated usage alerts at quota thresholds
+- Proration for mid-cycle subscription changes
+- Stripe/database reconciliation jobs
+- Production-grade authentication and authorization
+- Rate limiting
+- Structured logging
 - Production deployment
-- Production monitoring and logging
+- Additional integration tests
+- API documentation with OpenAPI/Swagger
 
-The core Stripe customer, subscription, webhook, webhook idempotency, and invoice synchronization functionality has already been implemented.
+These are outside the current implemented scope.
 
 ---
 
-## 17. Design Principles
+## 19. Design Principles
 
-The system is designed around the following principles:
+The system is designed around the following principles.
 
 ### Data Integrity
 
@@ -1033,7 +1116,7 @@ Important relationships and uniqueness rules are enforced by PostgreSQL.
 
 ### Transactional Consistency
 
-Usage recording and Stripe webhook processing use database transactions to ensure that related operations are handled consistently.
+Usage recording and Stripe webhook processing use database transactions to prevent partially completed operations.
 
 ### Idempotency
 
@@ -1051,7 +1134,11 @@ Services handle business logic.
 
 PostgreSQL handles persistent storage and database constraints.
 
-Stripe handles external payment and subscription infrastructure.
+Stripe handles external payment operations.
+
+### Tenant Isolation
+
+Tenant-specific queries are scoped using tenant IDs so that one tenant cannot access another tenant's usage, subscription, billing, or invoice records.
 
 ### Extensibility
 
@@ -1061,21 +1148,17 @@ The system supports multiple usage types and is designed so additional resource 
 
 Stripe is treated as an external payment provider rather than the source of truth for internal usage metering.
 
-Local usage and billing data remain under the application's control.
+Local usage and application-specific billing data remain under the application's control.
 
-### Security
+Verified Stripe webhook events are used to synchronize payment-related state into the local database.
 
-Stripe webhook requests are verified using Stripe's webhook signature before events are processed.
+### Correctness Over Complexity
 
-Sensitive Stripe credentials are stored in environment variables and are not committed to the repository.
+The system intentionally keeps the core architecture small while protecting the most important billing invariants:
 
-### Reliability
-
-Transactions and idempotency mechanisms are used to protect against:
-
-- Duplicate requests
-- Duplicate webhook delivery
-- Partial database operations
-- Concurrent usage requests
-
----
+- Usage must not be double-counted.
+- Quota checks must be consistent.
+- Stripe webhook events must be verified.
+- Stripe webhook events must be idempotent.
+- Tenant data must remain isolated.
+- Database changes must be transactional.
