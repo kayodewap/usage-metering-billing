@@ -1,0 +1,14 @@
+run: node src/server.js
+seed: null
+test: npm test
+
+base_url: http://localhost:3000
+
+endpoints:
+  health: GET /health
+  tenants: POST /tenants
+  usage: POST /usage
+  subscriptions: POST /subscriptions
+  billing: GET /billing
+  invoices: GET /invoices
+  stripe_webhook: POST /webhooks/stripe
