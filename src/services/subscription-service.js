@@ -21,7 +21,10 @@ export async function getTenantSubscription(tenantId) {
        subscriptions.status,
        plans.name AS plan_name,
        plans.api_call_quota,
-       plans.ai_token_quota
+       plans.ai_token_quota,
+       plans.monthly_price,
+       plans.api_call_overage_price,
+       plans.ai_token_overage_price
      FROM subscriptions
      JOIN plans
        ON subscriptions.plan_id = plans.id

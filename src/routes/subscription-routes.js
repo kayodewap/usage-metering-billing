@@ -10,6 +10,8 @@ import {
   getSubscriptionValidation,
   changeSubscriptionValidation
 } from "../services/subscription-validation.js";
+import { createStripeCustomer } from "../services/stripe-customer-service.js";
+import { createStripeSubscription } from "../services/stripe-subscription-service.js";
 
 const router = express.Router();
 
@@ -158,5 +160,115 @@ router.get(
     }
   }
 );
+
+router.post("/:tenantId/stripe-customer", async (req, res) => {
+  try {
+    const tenantId = Number(req.params.tenantId);
+
+    if (!Number.isInteger(tenantId) || tenantId <= 0) {
+      return res.status(400).json({
+        status: false,
+        message: "Invalid tenant ID",
+      });
+    }
+
+    const result = await createStripeCustomer(tenantId);
+
+    return res.status(result.duplicate ? 200 : 201).json({
+      status: true,
+      duplicate: result.duplicate,
+      data: {
+        customer_id: result.customer_id,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+
+    if (error.code === "STRIPE_NOT_CONFIGURED") {
+      return res.status(503).json({
+        status: false,
+        message: "Stripe is not configured",
+      });
+    }
+
+    if (error.code === "TENANT_NOT_FOUND") {
+      return res.status(404).json({
+        status: false,
+        message: "Tenant not found",
+      });
+    }
+
+    if (error.code === "NO_SUBSCRIPTION") {
+      return res.status(404).json({
+        status: false,
+        message: "Tenant has no subscription",
+      });
+    }
+
+    return res.status(500).json({
+      status: false,
+      message: "Failed to create Stripe customer",
+    });
+  }
+});
+
+router.post("/:tenantId/stripe-subscription", async (req, res) => {
+  try {
+    const tenantId = Number(req.params.tenantId);
+
+    if (!Number.isInteger(tenantId) || tenantId <= 0) {
+      return res.status(400).json({
+        status: false,
+        message: "Invalid tenant ID",
+      });
+    }
+
+    const result = await createStripeSubscription(tenantId);
+
+    return res.status(result.duplicate ? 200 : 201).json({
+      status: true,
+      duplicate: result.duplicate,
+      data: {
+        subscription_id: result.subscription_id,
+        status: result.status,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+
+    if (error.code === "STRIPE_NOT_CONFIGURED") {
+      return res.status(503).json({
+        status: false,
+        message: "Stripe is not configured",
+      });
+    }
+
+    if (error.code === "STRIPE_PRICE_NOT_CONFIGURED") {
+      return res.status(503).json({
+        status: false,
+        message: "Stripe Pro price is not configured",
+      });
+    }
+
+    if (error.code === "NO_SUBSCRIPTION") {
+      return res.status(404).json({
+        status: false,
+        message: "Tenant has no subscription",
+      });
+    }
+
+    if (error.code === "NO_STRIPE_CUSTOMER") {
+      return res.status(400).json({
+        status: false,
+        message: "Stripe customer has not been created",
+      });
+    }
+
+    return res.status(500).json({
+      status: false,
+      message: "Failed to create Stripe subscription",
+    });
+  }
+});
 
 export default router;
