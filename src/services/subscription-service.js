@@ -33,3 +33,17 @@ export async function getTenantSubscription(tenantId) {
 
   return result.rows[0] ?? null;
 }
+
+export async function changeSubscription(tenantId, planId) {
+  const result = await pool.query(
+    `UPDATE subscriptions
+     SET plan_id = $1,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE tenant_id = $2
+       AND status = 'active'
+     RETURNING *`,
+    [planId, tenantId]
+  );
+
+  return result.rows[0] ?? null;
+}
